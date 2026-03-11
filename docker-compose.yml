@@ -1,11 +1,10 @@
 services:
   lightline-node:
-    # build: .
-    image: ghcr.io/lightline-panel/lightline-node:latest
+    build: .
     restart: always
     network_mode: host
+    env_file: .env
 
-    # env_file: .env
     environment:
       SSL_CERT_FILE: "/var/lib/lightline-node/ssl_cert.pem"
       SSL_KEY_FILE: "/var/lib/lightline-node/ssl_key.pem"

@@ -127,18 +127,10 @@ install_cmd() {
         colorize blue "Setting up configuration..."
         echo ""
 
-        printf "  Node token (from panel → Nodes → Show Token): "
-        read -r node_token
-
-        if [ -z "$node_token" ]; then
-            colorize red "Node token is required. Get it from the Lightline Panel."
-            exit 1
-        fi
-
-        local node_port=9090
-        printf "  Node API port [%s]: " "$node_port"
+        local service_port=62050
+        printf "  Service port [%s]: " "$service_port"
         read -r input_port
-        [ -n "$input_port" ] && node_port="$input_port"
+        [ -n "$input_port" ] && service_port="$input_port"
 
         local ss_port=8388
         printf "  Shadowsocks port [%s]: " "$ss_port"
@@ -149,15 +141,15 @@ install_cmd() {
 # Lightline Node Configuration
 # Generated on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-NODE_PORT=$node_port
-NODE_HOST=0.0.0.0
-NODE_TOKEN=$node_token
+SERVICE_PORT=$service_port
+SERVICE_HOST=0.0.0.0
 
 SS_PORT=$ss_port
 SS_CONFIG_PATH=/etc/shadowsocks/config.json
 
-SSL_CERT_FILE=/var/lib/lightline-node/cert.pem
-SSL_KEY_FILE=/var/lib/lightline-node/key.pem
+SSL_CERT_FILE=/var/lib/lightline-node/ssl_cert.pem
+SSL_KEY_FILE=/var/lib/lightline-node/ssl_key.pem
+SSL_CLIENT_CERT_FILE=/var/lib/lightline-node/ssl_client_cert.pem
 EOF
 
         chmod 600 "$ENV_FILE"
@@ -166,6 +158,36 @@ EOF
 
     # Create data directory
     mkdir -p "$DATA_DIR"
+
+    # Prompt for panel certificate
+    local cert_file="$DATA_DIR/ssl_client_cert.pem"
+    if [ ! -f "$cert_file" ]; then
+        echo ""
+        colorize yellow "══════════════════════════════════════════════"
+        colorize yellow "  Panel Certificate Required"
+        colorize yellow "══════════════════════════════════════════════"
+        echo ""
+        echo "  Go to Lightline Panel → Nodes → Certificate"
+        echo "  Copy the certificate and paste it below."
+        echo "  (Paste all lines, then press Enter on an empty line)"
+        echo ""
+
+        local cert_content=""
+        local line=""
+        while IFS= read -r line; do
+            [ -z "$line" ] && break
+            cert_content="${cert_content}${line}"$'\n'
+        done
+
+        if [ -z "$cert_content" ]; then
+            colorize yellow "No certificate provided. You can add it later:"
+            colorize yellow "  nano $cert_file"
+        else
+            echo "$cert_content" > "$cert_file"
+            chmod 600 "$cert_file"
+            colorize green "Panel certificate saved to $cert_file"
+        fi
+    fi
 
     # Build and start
     detect_compose
@@ -183,10 +205,18 @@ EOF
     colorize green "  Lightline Node — Installed!"
     colorize cyan "══════════════════════════════════════════════"
     echo ""
-    echo "  Server IP:    $server_ip"
-    echo "  API Port:     $(grep NODE_PORT "$ENV_FILE" | head -1 | cut -d= -f2)"
-    echo "  SS Port:      $(grep SS_PORT "$ENV_FILE" | head -1 | cut -d= -f2)"
-    echo "  Install dir:  $INSTALL_DIR"
+    echo "  Server IP:      $server_ip"
+    echo "  Service Port:   $(grep SERVICE_PORT "$ENV_FILE" | head -1 | cut -d= -f2)"
+    echo "  SS Port:        $(grep SS_PORT "$ENV_FILE" | head -1 | cut -d= -f2)"
+    echo "  Install dir:    $INSTALL_DIR"
+    echo "  Data dir:       $DATA_DIR"
+    echo ""
+    if [ -f "$DATA_DIR/ssl_client_cert.pem" ]; then
+        colorize green "  Panel certificate: ✓ installed"
+    else
+        colorize yellow "  Panel certificate: ✗ not installed"
+        colorize yellow "  Paste it to: $DATA_DIR/ssl_client_cert.pem"
+    fi
     echo ""
     colorize yellow "  Now add this node in the Lightline Panel:"
     echo "    Name:    $(hostname)"
