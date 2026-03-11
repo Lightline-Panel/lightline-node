@@ -1,11 +1,11 @@
 """Lightline Node — Shadowsocks configuration manager.
 
-Manages ss-server config file and process. Each user gets their own
-password on a shared port using the multi-user feature of ss-rust,
-or individual ports with ss-libev.
+Manages ssserver config. Uses single-password mode (like Outline Server):
+one server password shared by all users on a single port.
+chacha20-ietf-poly1305 does NOT support multi-user 'users' array —
+only AEAD-2022 ciphers do. So we use one password per server.
 
-We use shadowsocks-rust with the `--manager-address` approach or
-a simple JSON config file that gets reloaded on changes.
+User differentiation (traffic, expiry) is handled at the panel level.
 """
 
 import json
@@ -45,55 +45,49 @@ def save_config(config: dict):
 
 
 def _default_config() -> dict:
-    """Default multi-user shadowsocks-rust config."""
+    """Default single-password shadowsocks-rust config."""
+    import secrets as _secrets
+    import base64 as _base64
     return {
         "server": "0.0.0.0",
         "server_port": 8388,
         "method": SS_METHOD,
-        "password": "",
-        "users": []
+        "password": _secrets.token_urlsafe(24),
+        "mode": "tcp_and_udp",
+        "no_delay": True
     }
 
 
 def add_user(username: str, password: str) -> dict:
-    """Add a user to the SS config."""
-    config = load_config()
-
-    # Check if user already exists
-    users = config.get("users", [])
-    for u in users:
+    """Register a user (tracked in metadata, not in SS config).
+    
+    In single-password mode, all users share the server password.
+    We keep a metadata list for the panel to query.
+    """
+    meta = _load_user_meta()
+    for u in meta:
         if u.get("name") == username:
             u["password"] = password
-            save_config(config)
+            _save_user_meta(meta)
             return {"action": "updated", "username": username}
-
-    users.append({"name": username, "password": password})
-    config["users"] = users
-
-    # For single-user mode (ss-libev), set the main password to first user
-    if not config.get("password") and users:
-        config["password"] = users[0]["password"]
-
-    save_config(config)
+    meta.append({"name": username, "password": password})
+    _save_user_meta(meta)
     return {"action": "added", "username": username}
 
 
 def remove_user(username: str) -> dict:
-    """Remove a user from the SS config."""
-    config = load_config()
-    users = config.get("users", [])
-    new_users = [u for u in users if u.get("name") != username]
-    if len(new_users) == len(users):
+    """Remove a user from metadata."""
+    meta = _load_user_meta()
+    new_meta = [u for u in meta if u.get("name") != username]
+    if len(new_meta) == len(meta):
         return {"action": "not_found", "username": username}
-    config["users"] = new_users
-    save_config(config)
+    _save_user_meta(new_meta)
     return {"action": "removed", "username": username}
 
 
 def list_users() -> list:
-    """List all configured users."""
-    config = load_config()
-    return config.get("users", [])
+    """List all registered users."""
+    return _load_user_meta()
 
 
 def get_server_port() -> int:
@@ -107,3 +101,33 @@ def set_server_port(port: int):
     config = load_config()
     config["server_port"] = port
     save_config(config)
+
+
+def get_server_password() -> str:
+    """Get the server's single shared password."""
+    config = load_config()
+    return config.get("password", "")
+
+
+# ===== User metadata (separate from SS config) =====
+
+USER_META_PATH = os.environ.get('USER_META_PATH',
+    str(Path(SS_CONFIG_PATH).parent / 'users.json'))
+
+
+def _load_user_meta() -> list:
+    path = Path(USER_META_PATH)
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_user_meta(meta: list):
+    path = Path(USER_META_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(meta, f, indent=2)

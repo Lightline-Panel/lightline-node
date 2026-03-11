@@ -25,22 +25,28 @@ def main():
         logger.error("NODE_TOKEN is required. Set it in .env")
         sys.exit(1)
 
-    # Generate self-signed cert if not present
-    if not (os.path.isfile(SSL_CERT_FILE) and os.path.isfile(SSL_KEY_FILE)):
-        logger.info("Generating self-signed TLS certificate...")
-        generate_certificate(SSL_CERT_FILE, SSL_KEY_FILE)
-
     logger.info(f"Lightline Node starting on {NODE_HOST}:{NODE_PORT}")
     logger.info(f"Shadowsocks port: {SS_PORT}")
 
-    uvicorn.run(
-        "service:app",
-        host=NODE_HOST,
-        port=NODE_PORT,
-        ssl_keyfile=SSL_KEY_FILE,
-        ssl_certfile=SSL_CERT_FILE,
-        log_level="info",
-    )
+    # SSL is optional — disabled by default for easier panel connectivity
+    use_ssl = os.environ.get('ENABLE_SSL', '').lower() in ('true', '1', 'yes')
+    kwargs = {
+        "host": NODE_HOST,
+        "port": NODE_PORT,
+        "log_level": "info",
+    }
+
+    if use_ssl:
+        if not (os.path.isfile(SSL_CERT_FILE) and os.path.isfile(SSL_KEY_FILE)):
+            logger.info("Generating self-signed TLS certificate...")
+            generate_certificate(SSL_CERT_FILE, SSL_KEY_FILE)
+        kwargs["ssl_keyfile"] = SSL_KEY_FILE
+        kwargs["ssl_certfile"] = SSL_CERT_FILE
+        logger.info("SSL enabled")
+    else:
+        logger.info("SSL disabled (set ENABLE_SSL=true to enable)")
+
+    uvicorn.run("service:app", **kwargs)
 
 
 if __name__ == "__main__":

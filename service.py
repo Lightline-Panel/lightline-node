@@ -18,7 +18,8 @@ from typing import Optional
 from config import NODE_TOKEN, SS_PORT
 from ss_config import (
     add_user, remove_user, list_users, load_config,
-    save_config, get_server_port, set_server_port, get_config_path
+    save_config, get_server_port, set_server_port, get_config_path,
+    get_server_password, SS_METHOD
 )
 
 logger = logging.getLogger('lightline-node')
@@ -144,20 +145,32 @@ async def get_users(token: str = Depends(verify_token)):
 
 @app.post("/users")
 async def create_user(req: AddUserRequest, token: str = Depends(verify_token)):
-    """Add a user to the SS config and restart."""
+    """Register a user in metadata (no SS restart needed in single-password mode)."""
     result = add_user(req.username, req.password)
-    restart_ss_server()
     return result
 
 
 @app.delete("/users/{username}")
 async def delete_user(username: str, token: str = Depends(verify_token)):
-    """Remove a user from the SS config and restart."""
+    """Remove a user from metadata."""
     result = remove_user(username)
     if result["action"] == "not_found":
         raise HTTPException(404, f"User '{username}' not found")
-    restart_ss_server()
     return result
+
+
+@app.get("/server-info")
+async def server_info(token: str = Depends(verify_token)):
+    """Return the server's shared SS password, port, and method.
+    
+    In single-password mode (Outline model), all users connect with
+    the same server password. The panel uses this to build ss:// URLs.
+    """
+    return {
+        "password": get_server_password(),
+        "port": get_server_port(),
+        "method": SS_METHOD,
+    }
 
 
 @app.post("/restart")
