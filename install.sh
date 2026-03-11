@@ -54,10 +54,10 @@ if [ ! -f "$ENV_FILE" ]; then
   echo "  ==============================="
   echo ""
 
-  read -p "  Outline API URL (e.g. https://127.0.0.1:12345/AbCdEf): " OUTLINE_URL
-  read -p "  Outline API Key (leave blank if included in URL): " OUTLINE_KEY
   read -p "  Node authentication token (from panel): " NODE_AUTH_TOKEN
-  read -p "  Node port [9090]: " NODE_PORT
+  read -p "  Shadowsocks port [8388]: " SS_PORT
+  SS_PORT=${SS_PORT:-8388}
+  read -p "  Node API port [9090]: " NODE_PORT
   NODE_PORT=${NODE_PORT:-9090}
 
   cat > "$ENV_FILE" <<EOF
@@ -66,8 +66,8 @@ NODE_PORT=$NODE_PORT
 NODE_HOST=0.0.0.0
 NODE_TOKEN=$NODE_AUTH_TOKEN
 
-OUTLINE_API_URL=$OUTLINE_URL
-OUTLINE_API_KEY=$OUTLINE_KEY
+SS_PORT=$SS_PORT
+SS_CONFIG_PATH=/etc/shadowsocks/config.json
 
 SSL_CERT_FILE=/var/lib/lightline-node/cert.pem
 SSL_KEY_FILE=/var/lib/lightline-node/key.pem
@@ -80,15 +80,19 @@ fi
 log "Building and starting lightline-node..."
 docker compose up -d --build
 
+SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || echo '<this-server-ip>')
+SS_PORT_VAL=$(grep SS_PORT $ENV_FILE | head -1 | cut -d= -f2)
+
 echo ""
 ok "Lightline Node installed and running!"
 echo ""
-echo "  Port:    $(grep NODE_PORT $ENV_FILE | cut -d= -f2)"
+echo "  SS Port: $SS_PORT_VAL"
+echo "  API Port: $(grep NODE_PORT $ENV_FILE | cut -d= -f2)"
 echo "  Config:  $ENV_FILE"
 echo "  Logs:    docker compose -f $INSTALL_DIR/docker-compose.yml logs -f"
 echo ""
 echo "  Add this node in the Lightline Panel with:"
-echo "    IP:       $(curl -s ifconfig.me 2>/dev/null || echo '<this-server-ip>')"
-echo "    Port:     $(grep NODE_PORT $ENV_FILE | cut -d= -f2)"
-echo "    API Key:  $(grep NODE_TOKEN $ENV_FILE | cut -d= -f2)"
+echo "    Name:     $(hostname)"
+echo "    IP:       $SERVER_IP"
+echo "    SS Port:  $SS_PORT_VAL"
 echo ""
