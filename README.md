@@ -1,91 +1,88 @@
 # Lightline Node
 
-Lightweight node agent for [Lightline VPN Panel](https://github.com/Lightline-Panel/lightline-panel). Install this on your remote servers to run Shadowsocks VPN — no external software (Outline, etc.) required.
+Proxy node for [Lightline VPN Panel](https://github.com/Lightline-Panel/lightline-panel). Follows the same architecture as [Marzban-node](https://github.com/Gozargah/Marzban-node) — certificate-based mTLS authentication, auto-generated SSL, and REST API.
 
 ## Architecture
 
 ```
-┌─────────────────┐         ┌──────────────────────┐
+┌─────────────────┐  mTLS   ┌──────────────────────┐
 │  Lightline Panel │ ──────▶ │  Lightline Node       │
 │  (Central)       │  REST   │  (Remote Server)      │
-│  Port 80/443     │ ◀────── │  Port 9090 (API)      │
-└─────────────────┘         │  Port 8388 (SS)        │
+│  Port 80/443     │ ◀────── │  Port 62050 (API)     │
+└─────────────────┘         │  Port 8388  (SS)       │
                             │                        │
                             │  ┌──────────────────┐  │
                             │  │ ssserver (SS-Rust)│  │
-                            │  │ Built-in, managed │  │
+                            │  │ Auto-managed      │  │
                             │  └──────────────────┘  │
                             └──────────────────────┘
 ```
 
-The node agent runs a Shadowsocks server (shadowsocks-rust) internally and exposes a REST API for the panel to manage users:
-
-- **Self-contained** — installs and runs `ssserver` automatically
-- **User management** — add/remove users via REST API from the panel
-- **Health reporting** — the panel checks if ss-server is running
-- **Auto-config** — SS config file is generated and managed automatically
+- **mTLS authentication** — Panel generates a certificate, admin copies it to the node. No tokens needed.
+- **Auto-generated SSL** — Node creates its own cert/key on first run.
+- **Self-contained** — Installs and manages `ssserver` (shadowsocks-rust) automatically.
+- **Session-based control** — Panel calls `/connect` to establish a session, then controls SS via `/start`, `/stop`, `/restart`.
 
 ## Quick Install
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Lightline-Panel/lightline-node/main/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Lightline-Panel/lightline-node/main/lightline-node.sh)" @ install
 ```
 
 ## Manual Install
 
-### Requirements
-- Python 3.10+
-- Docker (recommended) or shadowsocks-rust installed locally
-
-### Steps
-
-1. Clone the repository:
+1. Clone and create data directory:
 ```bash
-git clone https://github.com/Lightline-Panel/lightline-node.git /opt/lightline-node
-cd /opt/lightline-node
+git clone https://github.com/Lightline-Panel/lightline-node.git ~/lightline-node
+mkdir -p /var/lib/lightline-node
 ```
 
-2. Configure:
+2. Get the panel certificate:
+   - Go to **Nodes** page in Lightline Panel
+   - Click **Certificate** button
+   - Copy the certificate
+
+3. Paste the certificate on the node server:
 ```bash
-cp .env.example .env
-# Edit .env — set NODE_TOKEN and SS_PORT
+nano /var/lib/lightline-node/ssl_client_cert.pem
+# Paste the certificate and save
 ```
 
-3. Run with Docker (recommended):
+4. Start the node:
 ```bash
-docker compose up -d --build
+cd ~/lightline-node
+docker compose up -d
 ```
 
-Or run directly (requires shadowsocks-rust installed):
-```bash
-pip install -r requirements.txt
-python main.py
-```
+5. Return to the panel, add a new node with your server's IP address.
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `NODE_PORT` | `9090` | Port the node agent API listens on |
-| `NODE_HOST` | `0.0.0.0` | Bind address |
-| `NODE_TOKEN` | (required) | Authentication token (set in panel when adding node) |
-| `SS_PORT` | `8388` | Shadowsocks server port (clients connect here) |
-| `SS_CONFIG_PATH` | `/etc/shadowsocks/config.json` | SS config file path (auto-managed) |
-| `SSL_CERT_FILE` | `/var/lib/lightline-node/cert.pem` | TLS certificate for agent API |
-| `SSL_KEY_FILE` | `/var/lib/lightline-node/key.pem` | TLS private key for agent API |
+| `SERVICE_PORT` | `62050` | REST API port (panel connects here) |
+| `SERVICE_HOST` | `0.0.0.0` | Bind address |
+| `SS_PORT` | `8388` | Shadowsocks port (clients connect here) |
+| `SSL_CERT_FILE` | `/var/lib/lightline-node/ssl_cert.pem` | Node's SSL cert (auto-generated) |
+| `SSL_KEY_FILE` | `/var/lib/lightline-node/ssl_key.pem` | Node's SSL key (auto-generated) |
+| `SSL_CLIENT_CERT_FILE` | (empty) | Panel's certificate for mTLS verification |
+| `DEBUG` | `false` | Enable debug logging |
 
 ## API Endpoints
 
-All endpoints require `Authorization: Bearer <NODE_TOKEN>` header.
+Authentication is via mTLS (panel's client certificate). Session-based endpoints require a `session_id` from `/connect`.
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/` | Node status and info |
-| `GET` | `/health` | Health check (is ss-server running?) |
-| `GET` | `/users` | List configured SS users |
-| `POST` | `/users` | Add a user `{username, password}` |
-| `DELETE` | `/users/{username}` | Remove a user |
-| `POST` | `/restart` | Restart ss-server |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/connect` | mTLS | Establish session, returns `session_id` |
+| `POST` | `/disconnect` | mTLS | End session |
+| `POST` | `/ping` | Session | Heartbeat |
+| `GET` | `/health` | None | Health check |
+| `GET` | `/server-info` | None | SS password, port, method |
+| `GET` | `/status` | None | Full node status |
+| `POST` | `/start` | Session | Start ss-server |
+| `POST` | `/stop` | Session | Stop ss-server |
+| `POST` | `/restart` | Session | Restart ss-server |
 
 ## License
 

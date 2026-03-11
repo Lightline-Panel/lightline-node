@@ -23,7 +23,7 @@ COPY . .
 # Create config directory
 RUN mkdir -p /etc/shadowsocks
 
-# Expose node agent API port + SS port
-EXPOSE 9090 8388
+# Expose service API port + SS port
+EXPOSE 62050 8388
 
 CMD ["python", "main.py"]

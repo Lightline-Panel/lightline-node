@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Lightline Node — Main entry point.
 
-Runs a REST API agent that manages a local shadowsocks-rust/libev server.
-No external Outline Server required.
+Follows Marzban-node pattern:
+  - Auto-generates SSL cert/key on first run
+  - Uses mTLS with panel's client certificate for authentication
+  - No token-based auth — certificate IS the authentication
+  - REST API for panel to manage shadowsocks-rust on this node
 """
 
 import os
@@ -10,41 +13,54 @@ import sys
 import logging
 import uvicorn
 
-from config import NODE_PORT, NODE_HOST, NODE_TOKEN, SS_PORT, SSL_CERT_FILE, SSL_KEY_FILE
+from config import (
+    SERVICE_HOST, SERVICE_PORT, SS_PORT,
+    SSL_CERT_FILE, SSL_KEY_FILE, SSL_CLIENT_CERT_FILE, DEBUG
+)
 from certificate import generate_certificate
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if DEBUG else logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('lightline-node')
 
 
 def main():
-    if not NODE_TOKEN:
-        logger.error("NODE_TOKEN is required. Set it in .env")
+    # Auto-generate node SSL cert/key if missing
+    if not all((os.path.isfile(SSL_CERT_FILE), os.path.isfile(SSL_KEY_FILE))):
+        logger.info("Generating self-signed TLS certificate...")
+        generate_certificate(SSL_CERT_FILE, SSL_KEY_FILE)
+
+    if not SSL_CLIENT_CERT_FILE:
+        logger.warning(
+            "Running without SSL_CLIENT_CERT_FILE — anyone can connect to this node! "
+            "Set SSL_CLIENT_CERT_FILE to the panel's certificate for secure mTLS.")
+
+    if SSL_CLIENT_CERT_FILE and not os.path.isfile(SSL_CLIENT_CERT_FILE):
+        logger.error(
+            f"Client certificate file not found: {SSL_CLIENT_CERT_FILE}\n"
+            "Copy the panel's certificate to this path, or remove SSL_CLIENT_CERT_FILE to disable mTLS.")
         sys.exit(1)
 
-    logger.info(f"Lightline Node starting on {NODE_HOST}:{NODE_PORT}")
+    logger.info(f"Lightline Node starting on {SERVICE_HOST}:{SERVICE_PORT}")
     logger.info(f"Shadowsocks port: {SS_PORT}")
 
-    # SSL is optional — disabled by default for easier panel connectivity
-    use_ssl = os.environ.get('ENABLE_SSL', '').lower() in ('true', '1', 'yes')
     kwargs = {
-        "host": NODE_HOST,
-        "port": NODE_PORT,
-        "log_level": "info",
+        "host": SERVICE_HOST,
+        "port": SERVICE_PORT,
+        "log_level": "debug" if DEBUG else "info",
+        "ssl_keyfile": SSL_KEY_FILE,
+        "ssl_certfile": SSL_CERT_FILE,
     }
 
-    if use_ssl:
-        if not (os.path.isfile(SSL_CERT_FILE) and os.path.isfile(SSL_KEY_FILE)):
-            logger.info("Generating self-signed TLS certificate...")
-            generate_certificate(SSL_CERT_FILE, SSL_KEY_FILE)
-        kwargs["ssl_keyfile"] = SSL_KEY_FILE
-        kwargs["ssl_certfile"] = SSL_CERT_FILE
-        logger.info("SSL enabled")
+    # If client cert is provided, enable mTLS (verify panel's identity)
+    if SSL_CLIENT_CERT_FILE:
+        kwargs["ssl_ca_certs"] = SSL_CLIENT_CERT_FILE
+        kwargs["ssl_cert_reqs"] = 2  # ssl.CERT_REQUIRED
+        logger.info("mTLS enabled — only the panel with matching certificate can connect")
     else:
-        logger.info("SSL disabled (set ENABLE_SSL=true to enable)")
+        logger.info("mTLS disabled — any HTTPS client can connect")
 
     uvicorn.run("service:app", **kwargs)
 

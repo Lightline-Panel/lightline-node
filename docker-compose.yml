@@ -1,18 +1,16 @@
-version: "3.9"
-
 services:
   lightline-node:
-    build: .
-    restart: unless-stopped
-    ports:
-      - "${NODE_PORT:-9090}:9090"
-      - "${SS_PORT:-8388}:8388"
-    volumes:
-      - nodedata:/var/lib/lightline-node
-      - ssconfig:/etc/shadowsocks
-    env_file:
-      - .env
+    # build: .
+    image: ghcr.io/lightline-panel/lightline-node:latest
+    restart: always
+    network_mode: host
 
-volumes:
-  nodedata:
-  ssconfig:
+    # env_file: .env
+    environment:
+      SSL_CERT_FILE: "/var/lib/lightline-node/ssl_cert.pem"
+      SSL_KEY_FILE: "/var/lib/lightline-node/ssl_key.pem"
+      SSL_CLIENT_CERT_FILE: "/var/lib/lightline-node/ssl_client_cert.pem"
+
+    volumes:
+      - /var/lib/lightline-node:/var/lib/lightline-node
+      - /etc/shadowsocks:/etc/shadowsocks
