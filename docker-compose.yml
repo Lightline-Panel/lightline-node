@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  lightline-node:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${NODE_PORT:-9090}:9090"
+    volumes:
+      - nodedata:/var/lib/lightline-node
+    env_file:
+      - .env
+
+volumes:
+  nodedata:
