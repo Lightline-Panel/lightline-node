@@ -3,9 +3,9 @@
 Follows Marzban-node pattern:
   - Session-based connection (panel calls /connect first)
   - mTLS authentication (no bearer tokens)
-  - Panel controls ssserver lifecycle via /start, /stop, /restart
-  - /server-info returns server master key, port, method for URL building
-  - /users/add, /users/remove manage per-user keys (AEAD-2022 multi-user)
+  - Panel controls outline-ss-server lifecycle via /start, /stop, /restart
+  - /server-info returns port, method for URL building
+  - /users/add, /users/remove manage per-user keys (multi-user same port)
 """
 
 import platform
@@ -25,7 +25,7 @@ from config import SS_PORT
 from ss_config import (
     load_config, save_config, get_server_port, set_server_port,
     get_config_path, get_server_password, SS_METHOD,
-    add_user, remove_user, list_users, generate_ss_key
+    add_user, remove_user, list_users
 )
 
 logger = logging.getLogger('lightline-node')
@@ -251,46 +251,44 @@ def _get_active_connections() -> dict:
 
 
 def start_ss_server():
-    """Start the shadowsocks server process using config file (multi-user mode)."""
+    """Start the outline-ss-server process."""
     global _ss_process
     if _ss_process and _ss_process.poll() is None:
-        logger.info("ss-server already running")
+        logger.info("outline-ss-server already running")
         return True
 
     # Ensure config exists before starting
     config_path = get_config_path()
     config = load_config()
     save_config(config)  # write default config if missing
-    user_count = len(config.get('users', []))
-    logger.info(f"SS config: port={config.get('server_port')}, method={config.get('method')}, users={user_count}")
+    user_count = len(config.get('keys', []))
+    ss_port = get_server_port()
+    logger.info(f"SS config: port={ss_port}, method={SS_METHOD}, users={user_count}")
 
-    for binary in ['ssserver', 'ss-server']:
-        try:
-            # Use config file mode — required for multi-user AEAD-2022
-            cmd = [binary, '-c', config_path]
-            logger.info(f"Starting: {binary} -c {config_path}")
-            _ss_process = subprocess.Popen(
-                cmd,
-                stdout=None, stderr=None
-            )
-            # Wait briefly to check if it crashed immediately
-            import time as _t
-            _t.sleep(0.5)
-            if _ss_process.poll() is not None:
-                rc = _ss_process.returncode
-                logger.error(f"{binary} exited immediately with code {rc}")
-                _ss_process = None
-                continue
-            logger.info(f"Started {binary} (PID {_ss_process.pid}) with {user_count} users")
-            return True
-        except FileNotFoundError:
-            logger.debug(f"{binary} not found, trying next...")
-            continue
-        except Exception as e:
-            logger.error(f"Failed to start {binary}: {e}")
-            continue
-    logger.error("No shadowsocks binary found! Install shadowsocks-rust or shadowsocks-libev.")
-    return False
+    binary = 'outline-ss-server'
+    try:
+        cmd = [binary, '-config', config_path, '-replay_history', '10000']
+        logger.info(f"Starting: {' '.join(cmd)}")
+        _ss_process = subprocess.Popen(
+            cmd,
+            stdout=None, stderr=None
+        )
+        # Wait briefly to check if it crashed immediately
+        import time as _t
+        _t.sleep(0.5)
+        if _ss_process.poll() is not None:
+            rc = _ss_process.returncode
+            logger.error(f"{binary} exited immediately with code {rc}")
+            _ss_process = None
+            return False
+        logger.info(f"Started {binary} (PID {_ss_process.pid}) with {user_count} users on port {ss_port}")
+        return True
+    except FileNotFoundError:
+        logger.error(f"{binary} not found! Install outline-ss-server.")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to start {binary}: {e}")
+        return False
 
 
 def stop_ss_server():
@@ -347,8 +345,8 @@ def _check_session(session_id: UUID):
 @app.on_event("startup")
 async def startup():
     """Initialize SS config and start the server."""
-    config = load_config()
-    if SS_PORT and config.get("server_port") != SS_PORT:
+    load_config()  # triggers migration if needed
+    if SS_PORT and get_server_port() != SS_PORT:
         set_server_port(SS_PORT)
     start_ss_server()
     _setup_iptables()
@@ -424,13 +422,12 @@ async def health_check():
 
 @app.get("/server-info")
 async def server_info():
-    """Return the server's master key, port, method, and user count.
+    """Return server port, method, and user count.
     
     No session required — panel needs this to build ss:// URLs.
-    Multi-user mode: each user has their own key; server key is the master key.
+    Multi-user mode: each user has their own password on the same port.
     """
     return {
-        "password": get_server_password(),
         "port": get_server_port(),
         "method": SS_METHOD,
         "users": len(list_users()),
@@ -509,23 +506,23 @@ async def set_port(session_id: UUID = Body(...), port: int = Body(...)):
 
 @app.post("/users/add")
 async def api_add_user(session_id: UUID = Body(...), username: str = Body(...), password: str = Body(...)):
-    """Add a user key to the SS config and restart ss-server.
+    """Add a user to the outline-ss-server config and restart.
     
     Called by panel when creating a VPN user on this node.
-    Password must be a base64-encoded 16-byte key for AEAD-2022.
+    Each user gets a unique password on the same port.
     """
     _check_session(session_id)
     result = add_user(username, password)
     ok = restart_ss_server()
     if not ok:
         raise HTTPException(503, "User added but failed to restart ss-server")
-    logger.info(f"User '{username}' {result['action']} on node, ss-server restarted")
+    logger.info(f"User '{username}' {result['action']} on node, outline-ss-server restarted")
     return {"ok": True, **result}
 
 
 @app.post("/users/remove")
 async def api_remove_user(session_id: UUID = Body(...), username: str = Body(...)):
-    """Remove a user key from the SS config and restart ss-server.
+    """Remove a user from the outline-ss-server config and restart.
     
     Called by panel when deleting a VPN user from this node.
     """
@@ -536,7 +533,7 @@ async def api_remove_user(session_id: UUID = Body(...), username: str = Body(...
     ok = restart_ss_server()
     if not ok:
         raise HTTPException(503, "User removed but failed to restart ss-server")
-    logger.info(f"User '{username}' removed from node, ss-server restarted")
+    logger.info(f"User '{username}' removed from node, outline-ss-server restarted")
     return {"ok": True, **result}
 
 

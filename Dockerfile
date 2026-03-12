@@ -2,16 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install shadowsocks-rust
-RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates xz-utils iptables iproute2 conntrack && \
+# Install outline-ss-server (multi-user chacha20-ietf-poly1305 on same port)
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates iptables iproute2 conntrack && \
     ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "amd64" ]; then SS_ARCH="x86_64-unknown-linux-gnu"; \
-    elif [ "$ARCH" = "arm64" ]; then SS_ARCH="aarch64-unknown-linux-gnu"; \
-    else SS_ARCH="x86_64-unknown-linux-gnu"; fi && \
-    SS_VER="1.21.2" && \
-    wget -q "https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${SS_VER}/shadowsocks-v${SS_VER}.${SS_ARCH}.tar.xz" -O /tmp/ss.tar.xz && \
-    tar -xf /tmp/ss.tar.xz -C /usr/local/bin/ && \
-    rm /tmp/ss.tar.xz && \
+    if [ "$ARCH" = "amd64" ]; then SS_ARCH="linux_x86_64"; \
+    elif [ "$ARCH" = "arm64" ]; then SS_ARCH="linux_arm64"; \
+    else SS_ARCH="linux_x86_64"; fi && \
+    SS_VER="1.9.2" && \
+    wget -q "https://github.com/OutlineFoundation/tunnel-server/releases/download/v${SS_VER}/outline-ss-server_${SS_VER}_${SS_ARCH}.tar.gz" -O /tmp/ss.tar.gz && \
+    tar -xzf /tmp/ss.tar.gz -C /usr/local/bin/ outline-ss-server && \
+    rm /tmp/ss.tar.gz && \
     apt-get purge -y wget && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies

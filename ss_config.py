@@ -1,142 +1,181 @@
 """Lightline Node — Shadowsocks configuration manager.
 
-Multi-user mode using AEAD-2022 cipher (2022-blake3-aes-128-gcm).
-Each user gets their own unique key. The server has a master key.
-shadowsocks-rust config format:
-{
-  "server": "0.0.0.0",
-  "server_port": 8388,
-  "method": "2022-blake3-aes-128-gcm",
-  "password": "<server-key-base64>",
-  "users": [
-    {"name": "user1", "password": "<user-key-base64>"},
-    ...
-  ]
-}
+Uses outline-ss-server for multi-user support on the same port.
+Each user gets a unique password with chacha20-ietf-poly1305.
+The server differentiates users by trying each key during handshake.
 
-ss:// URL format for multi-user AEAD-2022:
-  ss://BASE64(method:server-key:user-key)@host:port#tag
+outline-ss-server config format (YAML):
+  keys:
+    - id: user1
+      port: 8388
+      cipher: chacha20-ietf-poly1305
+      secret: <password>
+    - id: user2
+      port: 8388
+      cipher: chacha20-ietf-poly1305
+      secret: <password>
+
+ss:// URL format (standard SIP002):
+  ss://BASE64(method:password)@host:port#tag
 """
 
-import json
 import os
-import base64
 import secrets
+import string
 import logging
 from pathlib import Path
 
+try:
+    import yaml
+except ImportError:
+    import json as yaml
+    yaml.safe_load = lambda s: __import__('json').loads(s)
+    yaml.dump = lambda d, f, **kw: f.write(__import__('json').dumps(d, indent=2))
+
 logger = logging.getLogger('lightline-node')
 
-SS_CONFIG_PATH = os.environ.get('SS_CONFIG_PATH', '/etc/shadowsocks/config.json')
-SS_METHOD = "2022-blake3-aes-128-gcm"
-SS_KEY_BYTES = 16  # aes-128-gcm requires 16-byte keys
+SS_CONFIG_PATH = os.environ.get('SS_CONFIG_PATH', '/etc/shadowsocks/config.yml')
+SS_METHOD = "chacha20-ietf-poly1305"
 
 
-def generate_ss_key() -> str:
-    """Generate a base64-encoded random key for AEAD-2022."""
-    return base64.b64encode(secrets.token_bytes(SS_KEY_BYTES)).decode()
+def generate_password(length: int = 24) -> str:
+    """Generate a random password for a Shadowsocks user."""
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
 def get_config_path() -> str:
     return SS_CONFIG_PATH
 
 
-def load_config() -> dict:
-    """Load the current SS config from disk."""
+def _load_raw() -> dict:
+    """Load the raw YAML config from disk."""
     path = Path(SS_CONFIG_PATH)
     if path.exists():
         try:
             with open(path) as f:
-                config = json.load(f)
-            # Migration: if old chacha20 config detected, regenerate with new cipher
-            if config.get("method") != SS_METHOD:
-                logger.info(f"Migrating config from {config.get('method')} to {SS_METHOD}")
-                old_port = config.get("server_port", 8388)
-                config = _default_config()
-                config["server_port"] = old_port
-                save_config(config)
-            return config
+                data = yaml.safe_load(f.read())
+            if isinstance(data, dict):
+                return data
         except Exception as e:
             logger.error(f"Failed to load SS config: {e}")
-    return _default_config()
+    return {"keys": []}
 
 
-def save_config(config: dict):
-    """Write config to disk."""
+def _save_raw(data: dict):
+    """Write YAML config to disk."""
     path = Path(SS_CONFIG_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w') as f:
-        json.dump(config, f, indent=2)
+        yaml.dump(data, f, default_flow_style=False)
     logger.info(f"SS config saved to {path}")
 
 
-def _default_config() -> dict:
-    """Default multi-user shadowsocks-rust config with AEAD-2022."""
-    return {
-        "server": "0.0.0.0",
-        "server_port": 8388,
-        "method": SS_METHOD,
-        "password": generate_ss_key(),
-        "users": [],
-        "mode": "tcp_and_udp",
-        "no_delay": True
-    }
+def load_config() -> dict:
+    """Load config. Handles migration from old JSON format."""
+    # Check if old JSON config exists and migrate
+    old_json = Path('/etc/shadowsocks/config.json')
+    yml_path = Path(SS_CONFIG_PATH)
+    if old_json.exists() and not yml_path.exists():
+        try:
+            import json
+            with open(old_json) as f:
+                old = json.load(f)
+            port = old.get('server_port', 8388)
+            logger.info(f"Migrating from old JSON config (port={port})")
+            data = {"keys": []}
+            _save_raw(data)
+            # Store port in a sidecar file
+            _save_port(port)
+        except Exception as e:
+            logger.error(f"Migration failed: {e}")
+    return _load_raw()
 
 
-def add_user(username: str, password: str) -> dict:
-    """Add a user to the SS config users array.
-    
-    The password must be a valid base64-encoded 16-byte key.
-    After calling this, restart ss-server to apply.
-    """
-    config = load_config()
-    users = config.get("users", [])
-    for u in users:
-        if u.get("name") == username:
-            u["password"] = password
-            save_config(config)
-            return {"action": "updated", "username": username}
-    users.append({"name": username, "password": password})
-    config["users"] = users
-    save_config(config)
-    return {"action": "added", "username": username}
+def save_config(data: dict):
+    """Write config to disk."""
+    _save_raw(data)
 
 
-def remove_user(username: str) -> dict:
-    """Remove a user from the SS config users array.
-    
-    After calling this, restart ss-server to apply.
-    """
-    config = load_config()
-    users = config.get("users", [])
-    new_users = [u for u in users if u.get("name") != username]
-    if len(new_users) == len(users):
-        return {"action": "not_found", "username": username}
-    config["users"] = new_users
-    save_config(config)
-    return {"action": "removed", "username": username}
+def _port_file() -> Path:
+    return Path(SS_CONFIG_PATH).parent / 'port'
 
 
-def list_users() -> list:
-    """List all users in the SS config."""
-    config = load_config()
-    return config.get("users", [])
+def _save_port(port: int):
+    p = _port_file()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(str(port))
 
 
 def get_server_port() -> int:
     """Get the configured server port."""
-    config = load_config()
-    return config.get("server_port", 8388)
+    p = _port_file()
+    if p.exists():
+        try:
+            return int(p.read_text().strip())
+        except Exception:
+            pass
+    return int(os.environ.get('SS_PORT', '8388'))
 
 
 def set_server_port(port: int):
-    """Set the server port."""
-    config = load_config()
-    config["server_port"] = port
-    save_config(config)
+    """Set the server port. Updates all keys in config to use new port."""
+    _save_port(port)
+    data = _load_raw()
+    for key in data.get("keys", []):
+        key["port"] = port
+    _save_raw(data)
+
+
+def add_user(username: str, password: str) -> dict:
+    """Add a user to the outline-ss-server config.
+    
+    Each user gets their own key entry with a unique password,
+    all sharing the same port and cipher.
+    After calling this, restart outline-ss-server to apply.
+    """
+    port = get_server_port()
+    data = _load_raw()
+    keys = data.get("keys", [])
+    for k in keys:
+        if k.get("id") == username:
+            k["secret"] = password
+            k["port"] = port
+            k["cipher"] = SS_METHOD
+            _save_raw(data)
+            return {"action": "updated", "username": username}
+    keys.append({
+        "id": username,
+        "port": port,
+        "cipher": SS_METHOD,
+        "secret": password,
+    })
+    data["keys"] = keys
+    _save_raw(data)
+    return {"action": "added", "username": username}
+
+
+def remove_user(username: str) -> dict:
+    """Remove a user from the outline-ss-server config.
+    
+    After calling this, restart outline-ss-server to apply.
+    """
+    data = _load_raw()
+    keys = data.get("keys", [])
+    new_keys = [k for k in keys if k.get("id") != username]
+    if len(new_keys) == len(keys):
+        return {"action": "not_found", "username": username}
+    data["keys"] = new_keys
+    _save_raw(data)
+    return {"action": "removed", "username": username}
+
+
+def list_users() -> list:
+    """List all users in the config."""
+    data = _load_raw()
+    return data.get("keys", [])
 
 
 def get_server_password() -> str:
-    """Get the server's master key (used in ss:// URL as server-key part)."""
-    config = load_config()
-    return config.get("password", "")
+    """Not used in multi-user mode. Returns empty string."""
+    return ""
