@@ -492,6 +492,28 @@ async def stats():
     }
 
 
+@app.post("/config/port")
+async def set_port(session_id: UUID = Body(...), port: int = Body(...)):
+    """Change the SS server port and restart ss-server.
+    
+    Called by panel when admin changes the global SS port in settings.
+    Requires active session.
+    """
+    _check_session(session_id)
+    if port < 1 or port > 65535:
+        raise HTTPException(400, "Invalid port number")
+    old_port = get_server_port()
+    set_server_port(port)
+    ok = restart_ss_server()
+    if not ok:
+        # Revert on failure
+        set_server_port(old_port)
+        restart_ss_server()
+        raise HTTPException(503, f"Failed to restart ss-server on port {port}, reverted to {old_port}")
+    logger.info(f"SS port changed from {old_port} to {port}, server restarted")
+    return {"ok": True, "old_port": old_port, "new_port": port}
+
+
 @app.get("/status")
 async def status():
     """Full node status — no session required."""
