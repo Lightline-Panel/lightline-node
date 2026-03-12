@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certifi
     if [ "$ARCH" = "amd64" ]; then SS_ARCH="x86_64-unknown-linux-gnu"; \
     elif [ "$ARCH" = "arm64" ]; then SS_ARCH="aarch64-unknown-linux-gnu"; \
     else SS_ARCH="x86_64-unknown-linux-gnu"; fi && \
-    SS_VER="1.20.4" && \
+    SS_VER="1.21.2" && \
     wget -q "https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${SS_VER}/shadowsocks-v${SS_VER}.${SS_ARCH}.tar.xz" -O /tmp/ss.tar.xz && \
     tar -xf /tmp/ss.tar.xz -C /usr/local/bin/ && \
     rm /tmp/ss.tar.xz && \

@@ -4,7 +4,8 @@ Follows Marzban-node pattern:
   - Session-based connection (panel calls /connect first)
   - mTLS authentication (no bearer tokens)
   - Panel controls ssserver lifecycle via /start, /stop, /restart
-  - /server-info returns shared SS password, port, method for URL building
+  - /server-info returns server master key, port, method for URL building
+  - /users/add, /users/remove manage per-user keys (AEAD-2022 multi-user)
 """
 
 import platform
@@ -23,7 +24,8 @@ from pydantic import BaseModel
 from config import SS_PORT
 from ss_config import (
     load_config, save_config, get_server_port, set_server_port,
-    get_config_path, get_server_password, SS_METHOD
+    get_config_path, get_server_password, SS_METHOD,
+    add_user, remove_user, list_users, generate_ss_key
 )
 
 logger = logging.getLogger('lightline-node')
@@ -249,7 +251,7 @@ def _get_active_connections() -> dict:
 
 
 def start_ss_server():
-    """Start the shadowsocks server process."""
+    """Start the shadowsocks server process using config file (multi-user mode)."""
     global _ss_process
     if _ss_process and _ss_process.poll() is None:
         logger.info("ss-server already running")
@@ -259,24 +261,14 @@ def start_ss_server():
     config_path = get_config_path()
     config = load_config()
     save_config(config)  # write default config if missing
-    logger.info(f"SS config: port={config.get('server_port')}, method={config.get('method')}, password={'***' if config.get('password') else 'EMPTY'}")
-
-    ss_port = config.get('server_port', 8388)
-    ss_method = config.get('method', 'chacha20-ietf-poly1305')
-    ss_password = config.get('password', '')
+    user_count = len(config.get('users', []))
+    logger.info(f"SS config: port={config.get('server_port')}, method={config.get('method')}, users={user_count}")
 
     for binary in ['ssserver', 'ss-server']:
         try:
-            # ssserver v1.20+ requires --encrypt-method and --server-addr even with -c
-            cmd = [
-                binary,
-                '-s', f'0.0.0.0:{ss_port}',
-                '-m', ss_method,
-                '-k', ss_password,
-                '-U',  # UDP relay
-                '--no-delay',
-            ]
-            logger.info(f"Starting: {binary} -s 0.0.0.0:{ss_port} -m {ss_method} -k *** -U --no-delay")
+            # Use config file mode — required for multi-user AEAD-2022
+            cmd = [binary, '-c', config_path]
+            logger.info(f"Starting: {binary} -c {config_path}")
             _ss_process = subprocess.Popen(
                 cmd,
                 stdout=None, stderr=None
@@ -289,7 +281,7 @@ def start_ss_server():
                 logger.error(f"{binary} exited immediately with code {rc}")
                 _ss_process = None
                 continue
-            logger.info(f"Started {binary} (PID {_ss_process.pid}) with config {config_path}")
+            logger.info(f"Started {binary} (PID {_ss_process.pid}) with {user_count} users")
             return True
         except FileNotFoundError:
             logger.debug(f"{binary} not found, trying next...")
@@ -432,15 +424,16 @@ async def health_check():
 
 @app.get("/server-info")
 async def server_info():
-    """Return the server's shared SS password, port, and method.
+    """Return the server's master key, port, method, and user count.
     
     No session required — panel needs this to build ss:// URLs.
-    In single-password mode, all users connect with the same password.
+    Multi-user mode: each user has their own key; server key is the master key.
     """
     return {
         "password": get_server_password(),
         "port": get_server_port(),
         "method": SS_METHOD,
+        "users": len(list_users()),
     }
 
 
@@ -512,6 +505,45 @@ async def set_port(session_id: UUID = Body(...), port: int = Body(...)):
         raise HTTPException(503, f"Failed to restart ss-server on port {port}, reverted to {old_port}")
     logger.info(f"SS port changed from {old_port} to {port}, server restarted")
     return {"ok": True, "old_port": old_port, "new_port": port}
+
+
+@app.post("/users/add")
+async def api_add_user(session_id: UUID = Body(...), username: str = Body(...), password: str = Body(...)):
+    """Add a user key to the SS config and restart ss-server.
+    
+    Called by panel when creating a VPN user on this node.
+    Password must be a base64-encoded 16-byte key for AEAD-2022.
+    """
+    _check_session(session_id)
+    result = add_user(username, password)
+    ok = restart_ss_server()
+    if not ok:
+        raise HTTPException(503, "User added but failed to restart ss-server")
+    logger.info(f"User '{username}' {result['action']} on node, ss-server restarted")
+    return {"ok": True, **result}
+
+
+@app.post("/users/remove")
+async def api_remove_user(session_id: UUID = Body(...), username: str = Body(...)):
+    """Remove a user key from the SS config and restart ss-server.
+    
+    Called by panel when deleting a VPN user from this node.
+    """
+    _check_session(session_id)
+    result = remove_user(username)
+    if result["action"] == "not_found":
+        return {"ok": True, **result}
+    ok = restart_ss_server()
+    if not ok:
+        raise HTTPException(503, "User removed but failed to restart ss-server")
+    logger.info(f"User '{username}' removed from node, ss-server restarted")
+    return {"ok": True, **result}
+
+
+@app.get("/users/list")
+async def api_list_users():
+    """List all users in the SS config. No auth required."""
+    return {"users": list_users()}
 
 
 @app.get("/status")
