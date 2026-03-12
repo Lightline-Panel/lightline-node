@@ -14,9 +14,12 @@ import subprocess
 import signal
 import os
 import json
+import re
 import logging
 from pathlib import Path
 from uuid import UUID, uuid4
+from urllib.request import urlopen
+from urllib.error import URLError
 from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -37,6 +40,7 @@ app = FastAPI(title="Lightline Node", docs_url=None, redoc_url=None)
 _start_time = time.time()
 _ss_process: subprocess.Popen = None
 TRAFFIC_STATE_FILE = os.environ.get('TRAFFIC_STATE_FILE', '/var/lib/lightline-node/traffic.json')
+METRICS_PORT = int(os.environ.get('METRICS_PORT', '9091'))
 _IPTABLES_CHAIN = 'LIGHTLINE_STATS'
 _iptables_ready = False
 
@@ -51,65 +55,37 @@ def _run_cmd(cmd: list, timeout: int = 5) -> tuple:
 
 
 def _setup_iptables():
-    """Set up iptables accounting rules for the SS port.
-    
-    Creates a custom chain LIGHTLINE_STATS with rules to count
-    all incoming and outgoing bytes on the SS port (both TCP and UDP).
-    Counters persist across reads — we read them cumulatively.
-    """
+    """Set up iptables accounting rules for the SS port (fallback)."""
     global _iptables_ready
     ss_port = get_server_port()
-
-    # Create chain (ignore error if exists)
     _run_cmd(['iptables', '-N', _IPTABLES_CHAIN])
-
-    # Flush existing rules in our chain
     _run_cmd(['iptables', '-F', _IPTABLES_CHAIN])
-
-    # Add counting rules inside our chain:
-    # - Incoming traffic (download): destination port = ss_port
-    # - Outgoing traffic (upload): source port = ss_port
     for proto in ['tcp', 'udp']:
         _run_cmd(['iptables', '-A', _IPTABLES_CHAIN, '-p', proto, '--dport', str(ss_port), '-j', 'RETURN'])
         _run_cmd(['iptables', '-A', _IPTABLES_CHAIN, '-p', proto, '--sport', str(ss_port), '-j', 'RETURN'])
-
-    # Hook our chain into INPUT and OUTPUT (remove old refs first, ignore errors)
     for chain in ['INPUT', 'OUTPUT']:
         _run_cmd(['iptables', '-D', chain, '-j', _IPTABLES_CHAIN])
-        out, err, rc = _run_cmd(['iptables', '-I', chain, '-j', _IPTABLES_CHAIN])
-        if rc != 0:
-            logger.warning(f"Failed to hook {_IPTABLES_CHAIN} into {chain}: {err}")
-
+        _run_cmd(['iptables', '-I', chain, '-j', _IPTABLES_CHAIN])
     _iptables_ready = True
     logger.info(f"iptables accounting rules set up for port {ss_port}")
 
 
 def _read_iptables_bytes() -> dict:
-    """Read cumulative byte counters from iptables LIGHTLINE_STATS chain.
-    
-    Returns download (dport rules) and upload (sport rules) bytes.
-    iptables counters are cumulative since chain creation / last reset.
-    """
+    """Read cumulative byte counters from iptables (fallback)."""
     if not _iptables_ready:
         return {"upload": 0, "download": 0}
-
     out, err, rc = _run_cmd(['iptables', '-L', _IPTABLES_CHAIN, '-n', '-v', '-x'])
     if rc != 0:
-        logger.debug(f"iptables read failed: {err}")
         return {"upload": 0, "download": 0}
-
-    download = 0  # dport rules = incoming to SS = client download
-    upload = 0    # sport rules = outgoing from SS = client upload
-
+    download = 0
+    upload = 0
     ss_port = str(get_server_port())
-    for line in out.strip().split('\n')[2:]:  # skip header lines
+    for line in out.strip().split('\n')[2:]:
         parts = line.split()
         if len(parts) < 10:
             continue
         try:
             byte_count = int(parts[1])
-            # Check if this is a dport or sport rule
-            # Format: pkts bytes target prot opt in out source destination [extra...]
             rest = ' '.join(parts[8:])
             if f'dpt:{ss_port}' in rest:
                 download += byte_count
@@ -117,51 +93,125 @@ def _read_iptables_bytes() -> dict:
                 upload += byte_count
         except (ValueError, IndexError):
             continue
-
     return {"upload": upload, "download": download}
 
 
-def _load_traffic_state():
-    """Load saved traffic offset from previous container runs.
+# ===== Prometheus Metrics Parsing (per-user traffic from outline-ss-server) =====
+
+_PROM_DATA_RE = re.compile(
+    r'shadowsocks_data_bytes\{access_key="([^"]*)",dir="(c2s|s2c|s2p|p2t)"\}\s+(\d+)'
+)
+_PROM_DATA_RE_TOTAL = re.compile(
+    r'shadowsocks_data_bytes_per_location\{.*?access_key="([^"]*)",.*?dir="(c2s|s2c|s2p|p2t)".*?\}\s+(\d+)'
+)
+
+def _scrape_prometheus() -> str:
+    """Fetch raw Prometheus metrics text from outline-ss-server."""
+    try:
+        resp = urlopen(f'http://127.0.0.1:{METRICS_PORT}/metrics', timeout=3)
+        return resp.read().decode('utf-8', errors='replace')
+    except (URLError, OSError, Exception) as e:
+        logger.debug(f"Failed to scrape Prometheus metrics: {e}")
+        return ''
+
+
+def _parse_per_user_traffic(metrics_text: str) -> dict:
+    """Parse per-user traffic from Prometheus metrics.
     
-    When the container restarts, iptables counters reset to 0.
-    We save the cumulative total before shutdown so we can add it back.
+    outline-ss-server exports:
+      shadowsocks_data_bytes{access_key="username",dir="c2s"} NNN
+      shadowsocks_data_bytes{access_key="username",dir="s2c"} NNN
+    
+    c2s = client-to-server = upload from client perspective
+    s2c = server-to-client = download from client perspective
+    
+    Returns: {"username": {"upload": int, "download": int}, ...}
+    """
+    per_user = {}
+    for match in _PROM_DATA_RE.finditer(metrics_text):
+        key_id, direction, byte_str = match.groups()
+        if key_id not in per_user:
+            per_user[key_id] = {"upload": 0, "download": 0}
+        if direction in ('c2s', 'p2t'):
+            per_user[key_id]["upload"] += int(byte_str)
+        elif direction in ('s2c', 's2p'):
+            per_user[key_id]["download"] += int(byte_str)
+    # Also try per_location variant
+    for match in _PROM_DATA_RE_TOTAL.finditer(metrics_text):
+        key_id, direction, byte_str = match.groups()
+        if key_id not in per_user:
+            per_user[key_id] = {"upload": 0, "download": 0}
+        if direction in ('c2s', 'p2t'):
+            per_user[key_id]["upload"] += int(byte_str)
+        elif direction in ('s2c', 's2p'):
+            per_user[key_id]["download"] += int(byte_str)
+    return per_user
+
+
+def _load_traffic_state() -> dict:
+    """Load saved traffic state from previous runs.
+    
+    Returns: {"per_user": {username: {upload, download}}, "total": {upload, download}}
     """
     try:
         p = Path(TRAFFIC_STATE_FILE)
         if p.exists():
             data = json.loads(p.read_text())
-            logger.info(f"Loaded traffic state: up={data.get('upload', 0)}, down={data.get('download', 0)}")
-            return {"upload": data.get("upload", 0), "download": data.get("download", 0)}
+            return {
+                "per_user": data.get("per_user", {}),
+                "total": {"upload": data.get("upload", 0), "download": data.get("download", 0)},
+            }
     except Exception as e:
         logger.warning(f"Failed to load traffic state: {e}")
-    return {"upload": 0, "download": 0}
+    return {"per_user": {}, "total": {"upload": 0, "download": 0}}
 
 
 def _save_traffic_state():
-    """Save current cumulative traffic (iptables counters + offset) before shutdown."""
+    """Save current cumulative traffic before shutdown."""
     try:
-        offset = _load_traffic_state()
-        current = _read_iptables_bytes()
-        total = {
-            "upload": offset["upload"] + current["upload"],
-            "download": offset["download"] + current["download"],
-        }
+        traffic = _get_traffic()
         p = Path(TRAFFIC_STATE_FILE)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(total))
-        logger.info(f"Saved traffic state: up={total['upload']}, down={total['download']}")
+        save_data = {
+            "upload": traffic["total"]["upload"],
+            "download": traffic["total"]["download"],
+            "per_user": traffic["per_user"],
+        }
+        p.write_text(json.dumps(save_data))
+        logger.info(f"Saved traffic state: total_up={traffic['total']['upload']}, total_down={traffic['total']['download']}, users={len(traffic['per_user'])}")
     except Exception as e:
         logger.warning(f"Failed to save traffic state: {e}")
 
 
 def _get_traffic() -> dict:
-    """Get total cumulative traffic (iptables current + saved offset)."""
+    """Get traffic data. Prefers Prometheus per-user metrics, falls back to iptables.
+    
+    Returns: {
+        "per_user": {username: {"upload": int, "download": int}},
+        "total": {"upload": int, "download": int},
+    }
+    """
+    metrics_text = _scrape_prometheus()
+    per_user = _parse_per_user_traffic(metrics_text)
+    
+    if per_user:
+        # Prometheus working — compute total from per-user
+        total_up = sum(u["upload"] for u in per_user.values())
+        total_down = sum(u["download"] for u in per_user.values())
+        return {
+            "per_user": per_user,
+            "total": {"upload": total_up, "download": total_down},
+        }
+    
+    # Fallback to iptables
     offset = _load_traffic_state()
     current = _read_iptables_bytes()
     return {
-        "upload": offset["upload"] + current["upload"],
-        "download": offset["download"] + current["download"],
+        "per_user": offset.get("per_user", {}),
+        "total": {
+            "upload": offset["total"]["upload"] + current["upload"],
+            "download": offset["total"]["download"] + current["download"],
+        },
     }
 
 
@@ -271,7 +321,8 @@ def start_ss_server():
 
     binary = 'outline-ss-server'
     try:
-        cmd = [binary, '-config', config_path, '-replay_history', '10000']
+        cmd = [binary, '-config', config_path, '-replay_history', '10000',
+               '-metrics', f':{METRICS_PORT}']
         logger.info(f"Starting: {' '.join(cmd)}")
         _ss_process = subprocess.Popen(
             cmd,
@@ -503,15 +554,17 @@ async def restart(session_id: UUID = Body(embed=True)):
 async def stats():
     """Traffic statistics and active connections — no auth required.
     
-    Returns cumulative upload/download bytes and connected device info.
+    Returns cumulative upload/download bytes (total and per-user) and connected device info.
     Panel polls this endpoint periodically to update TrafficLog.
-    Uses iptables byte counters (TCP+UDP) and `ss` command for connections.
+    Prefers Prometheus metrics from outline-ss-server for per-user data,
+    falls back to iptables for total-only.
     """
     traffic = _get_traffic()
     conns = _get_active_connections()
     return {
-        "upload": traffic["upload"],
-        "download": traffic["download"],
+        "upload": traffic["total"]["upload"],
+        "download": traffic["total"]["download"],
+        "per_user": traffic.get("per_user", {}),
         "active_connections": conns["count"],
         "connected_devices": conns["devices"],
         "connected_ips": conns["unique_ips"],
