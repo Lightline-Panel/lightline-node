@@ -3,7 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install shadowsocks-rust
-RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates xz-utils && \
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates xz-utils iptables iproute2 conntrack && \
     ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "amd64" ]; then SS_ARCH="x86_64-unknown-linux-gnu"; \
     elif [ "$ARCH" = "arm64" ]; then SS_ARCH="aarch64-unknown-linux-gnu"; \

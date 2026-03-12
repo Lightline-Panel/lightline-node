@@ -14,8 +14,6 @@ import signal
 import os
 import json
 import logging
-import struct
-import socket
 from pathlib import Path
 from uuid import UUID, uuid4
 from fastapi import FastAPI, HTTPException, Body, Request
@@ -36,115 +34,215 @@ app = FastAPI(title="Lightline Node", docs_url=None, redoc_url=None)
 
 _start_time = time.time()
 _ss_process: subprocess.Popen = None
-_traffic_offset = {"upload": 0, "download": 0}  # cumulative from previous ssserver runs
 TRAFFIC_STATE_FILE = os.environ.get('TRAFFIC_STATE_FILE', '/var/lib/lightline-node/traffic.json')
+_IPTABLES_CHAIN = 'LIGHTLINE_STATS'
+_iptables_ready = False
+
+
+def _run_cmd(cmd: list, timeout: int = 5) -> tuple:
+    """Run a shell command and return (stdout, stderr, returncode)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout, r.stderr, r.returncode
+    except Exception as e:
+        return '', str(e), -1
+
+
+def _setup_iptables():
+    """Set up iptables accounting rules for the SS port.
+    
+    Creates a custom chain LIGHTLINE_STATS with rules to count
+    all incoming and outgoing bytes on the SS port (both TCP and UDP).
+    Counters persist across reads — we read them cumulatively.
+    """
+    global _iptables_ready
+    ss_port = get_server_port()
+
+    # Create chain (ignore error if exists)
+    _run_cmd(['iptables', '-N', _IPTABLES_CHAIN])
+
+    # Flush existing rules in our chain
+    _run_cmd(['iptables', '-F', _IPTABLES_CHAIN])
+
+    # Add counting rules inside our chain:
+    # - Incoming traffic (download): destination port = ss_port
+    # - Outgoing traffic (upload): source port = ss_port
+    for proto in ['tcp', 'udp']:
+        _run_cmd(['iptables', '-A', _IPTABLES_CHAIN, '-p', proto, '--dport', str(ss_port), '-j', 'RETURN'])
+        _run_cmd(['iptables', '-A', _IPTABLES_CHAIN, '-p', proto, '--sport', str(ss_port), '-j', 'RETURN'])
+
+    # Hook our chain into INPUT and OUTPUT (remove old refs first, ignore errors)
+    for chain in ['INPUT', 'OUTPUT']:
+        _run_cmd(['iptables', '-D', chain, '-j', _IPTABLES_CHAIN])
+        out, err, rc = _run_cmd(['iptables', '-I', chain, '-j', _IPTABLES_CHAIN])
+        if rc != 0:
+            logger.warning(f"Failed to hook {_IPTABLES_CHAIN} into {chain}: {err}")
+
+    _iptables_ready = True
+    logger.info(f"iptables accounting rules set up for port {ss_port}")
+
+
+def _read_iptables_bytes() -> dict:
+    """Read cumulative byte counters from iptables LIGHTLINE_STATS chain.
+    
+    Returns download (dport rules) and upload (sport rules) bytes.
+    iptables counters are cumulative since chain creation / last reset.
+    """
+    if not _iptables_ready:
+        return {"upload": 0, "download": 0}
+
+    out, err, rc = _run_cmd(['iptables', '-L', _IPTABLES_CHAIN, '-n', '-v', '-x'])
+    if rc != 0:
+        logger.debug(f"iptables read failed: {err}")
+        return {"upload": 0, "download": 0}
+
+    download = 0  # dport rules = incoming to SS = client download
+    upload = 0    # sport rules = outgoing from SS = client upload
+
+    ss_port = str(get_server_port())
+    for line in out.strip().split('\n')[2:]:  # skip header lines
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        try:
+            byte_count = int(parts[1])
+            # Check if this is a dport or sport rule
+            # Format: pkts bytes target prot opt in out source destination [extra...]
+            rest = ' '.join(parts[8:])
+            if f'dpt:{ss_port}' in rest:
+                download += byte_count
+            elif f'spt:{ss_port}' in rest:
+                upload += byte_count
+        except (ValueError, IndexError):
+            continue
+
+    return {"upload": upload, "download": download}
 
 
 def _load_traffic_state():
-    """Load cumulative traffic from previous ssserver runs."""
-    global _traffic_offset
+    """Load saved traffic offset from previous container runs.
+    
+    When the container restarts, iptables counters reset to 0.
+    We save the cumulative total before shutdown so we can add it back.
+    """
     try:
         p = Path(TRAFFIC_STATE_FILE)
         if p.exists():
             data = json.loads(p.read_text())
-            _traffic_offset = {"upload": data.get("upload", 0), "download": data.get("download", 0)}
-            logger.info(f"Loaded traffic state: up={_traffic_offset['upload']}, down={_traffic_offset['download']}")
+            logger.info(f"Loaded traffic state: up={data.get('upload', 0)}, down={data.get('download', 0)}")
+            return {"upload": data.get("upload", 0), "download": data.get("download", 0)}
     except Exception as e:
         logger.warning(f"Failed to load traffic state: {e}")
+    return {"upload": 0, "download": 0}
 
 
 def _save_traffic_state():
-    """Save cumulative traffic before ssserver stops."""
+    """Save current cumulative traffic (iptables counters + offset) before shutdown."""
     try:
-        current = _get_process_io()
-        total_up = _traffic_offset["upload"] + current["upload"]
-        total_down = _traffic_offset["download"] + current["download"]
+        offset = _load_traffic_state()
+        current = _read_iptables_bytes()
+        total = {
+            "upload": offset["upload"] + current["upload"],
+            "download": offset["download"] + current["download"],
+        }
         p = Path(TRAFFIC_STATE_FILE)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"upload": total_up, "download": total_down}))
-        logger.info(f"Saved traffic state: up={total_up}, down={total_down}")
+        p.write_text(json.dumps(total))
+        logger.info(f"Saved traffic state: up={total['upload']}, down={total['download']}")
     except Exception as e:
         logger.warning(f"Failed to save traffic state: {e}")
 
 
-def _get_process_io() -> dict:
-    """Read ssserver process I/O from /proc/{pid}/io.
-    
-    Returns upload (write_bytes) and download (read_bytes) for current process.
-    """
-    if not _ss_process or _ss_process.poll() is not None:
-        return {"upload": 0, "download": 0}
-    try:
-        io_path = f"/proc/{_ss_process.pid}/io"
-        with open(io_path, 'r') as f:
-            data = {}
-            for line in f:
-                parts = line.strip().split(': ')
-                if len(parts) == 2:
-                    data[parts[0]] = int(parts[1])
-        return {
-            "upload": data.get("write_bytes", 0),
-            "download": data.get("read_bytes", 0),
-        }
-    except (FileNotFoundError, PermissionError, ValueError) as e:
-        logger.debug(f"Cannot read process IO: {e}")
-        return {"upload": 0, "download": 0}
+def _get_traffic() -> dict:
+    """Get total cumulative traffic (iptables current + saved offset)."""
+    offset = _load_traffic_state()
+    current = _read_iptables_bytes()
+    return {
+        "upload": offset["upload"] + current["upload"],
+        "download": offset["download"] + current["download"],
+    }
+
+
+def _parse_ip_from_addr(addr: str) -> str:
+    """Extract IP from address string like '1.2.3.4:12345' or '[::1]:12345'."""
+    if addr.startswith('['):
+        return addr.split(']')[0][1:]
+    elif addr.count(':') > 1:
+        return ':'.join(addr.split(':')[:-1])
+    else:
+        return addr.rsplit(':', 1)[0]
 
 
 def _get_active_connections() -> dict:
-    """Count active TCP connections to the SS port and list unique client IPs.
+    """Count active connections to the SS port.
     
-    Reads /proc/net/tcp (and /proc/net/tcp6) for ESTABLISHED connections.
+    Strategy:
+    1. TCP connections via `ss -t` (established TCP sockets on SS port)
+    2. UDP flows via `conntrack` (netfilter tracks UDP flows even though UDP is connectionless)
+    3. Fallback: `ss -u` for any UDP sockets that show a peer
+    
+    Extracts unique client IPs across all methods.
     """
     ss_port = get_server_port()
-    connections = []
     unique_ips = set()
-    
-    for tcp_file in ['/proc/net/tcp', '/proc/net/tcp6']:
-        try:
-            with open(tcp_file, 'r') as f:
-                for line in f.readlines()[1:]:  # skip header
-                    parts = line.strip().split()
-                    if len(parts) < 4:
-                        continue
-                    # State 01 = ESTABLISHED
-                    state = parts[3]
-                    if state != '01':
-                        continue
-                    # local_address is hex ip:port
-                    local = parts[1]
-                    local_port = int(local.split(':')[1], 16)
-                    if local_port != ss_port:
-                        continue
-                    # remote address
-                    remote = parts[2]
-                    remote_hex_ip = remote.split(':')[0]
-                    try:
-                        if tcp_file.endswith('tcp6') and len(remote_hex_ip) == 32:
-                            # IPv6 or IPv4-mapped-IPv6
-                            ip_bytes = bytes.fromhex(remote_hex_ip)
-                            # Check if it's IPv4-mapped (::ffff:x.x.x.x)
-                            if ip_bytes[:12] == b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff':
-                                ip_str = socket.inet_ntoa(ip_bytes[12:16][::-1] if len(remote_hex_ip) == 8 else ip_bytes[12:16])
-                            else:
-                                # Reverse each 4-byte group for /proc/net/tcp6 little-endian format
-                                groups = [ip_bytes[i:i+4][::-1] for i in range(0, 16, 4)]
-                                ip_str = socket.inet_ntop(socket.AF_INET6, b''.join(groups))
-                        else:
-                            # IPv4: stored as little-endian hex
-                            ip_int = int(remote_hex_ip, 16)
-                            ip_str = socket.inet_ntoa(struct.pack('<I', ip_int))
-                    except Exception:
-                        ip_str = remote_hex_ip
-                    unique_ips.add(ip_str)
-                    connections.append(ip_str)
-        except FileNotFoundError:
-            continue
-        except Exception as e:
-            logger.debug(f"Cannot read {tcp_file}: {e}")
-    
+    total_conns = 0
+
+    # --- Method 1: TCP established connections via ss ---
+    try:
+        out, err, rc = _run_cmd([
+            'ss', '-t', '-n', 'state', 'established',
+            f'sport = :{ss_port}'
+        ])
+        if rc == 0 and out.strip():
+            for line in out.strip().split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 5:
+                    ip = _parse_ip_from_addr(parts[4])
+                    if ip and ip not in ('*', '0.0.0.0', '::'):
+                        unique_ips.add(ip)
+                        total_conns += 1
+    except Exception as e:
+        logger.debug(f"ss TCP failed: {e}")
+
+    # --- Method 2: UDP flows via conntrack ---
+    try:
+        out, err, rc = _run_cmd([
+            'conntrack', '-L', '-p', 'udp',
+            '--dport', str(ss_port), '-o', 'extended'
+        ], timeout=5)
+        if rc == 0 and out.strip():
+            for line in out.strip().split('\n'):
+                # conntrack lines: udp ... src=1.2.3.4 dst=... sport=... dport=8388
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('src='):
+                        ip = part[4:]
+                        if ip and ip not in ('0.0.0.0', '127.0.0.1', '::'):
+                            unique_ips.add(ip)
+                            total_conns += 1
+                        break
+    except Exception as e:
+        logger.debug(f"conntrack failed: {e}")
+
+    # --- Method 3: Fallback — ss UDP sockets ---
+    try:
+        out, err, rc = _run_cmd([
+            'ss', '-u', '-n', '-a',
+            f'sport = :{ss_port}'
+        ])
+        if rc == 0 and out.strip():
+            for line in out.strip().split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 5:
+                    ip = _parse_ip_from_addr(parts[4])
+                    if ip and ip not in ('*', '0.0.0.0', '::', '0.0.0.0:*'):
+                        unique_ips.add(ip)
+                        total_conns += 1
+    except Exception as e:
+        logger.debug(f"ss UDP failed: {e}")
+
     return {
-        "count": len(connections),
+        "count": total_conns,
         "unique_ips": list(unique_ips),
         "devices": len(unique_ips),
     }
@@ -257,11 +355,11 @@ def _check_session(session_id: UUID):
 @app.on_event("startup")
 async def startup():
     """Initialize SS config and start the server."""
-    _load_traffic_state()
     config = load_config()
     if SS_PORT and config.get("server_port") != SS_PORT:
         set_server_port(SS_PORT)
     start_ss_server()
+    _setup_iptables()
 
 
 @app.on_event("shutdown")
@@ -380,12 +478,13 @@ async def stats():
     
     Returns cumulative upload/download bytes and connected device info.
     Panel polls this endpoint periodically to update TrafficLog.
+    Uses iptables byte counters (TCP+UDP) and `ss` command for connections.
     """
-    proc_io = _get_process_io()
+    traffic = _get_traffic()
     conns = _get_active_connections()
     return {
-        "upload": _traffic_offset["upload"] + proc_io["upload"],
-        "download": _traffic_offset["download"] + proc_io["download"],
+        "upload": traffic["upload"],
+        "download": traffic["download"],
         "active_connections": conns["count"],
         "connected_devices": conns["devices"],
         "connected_ips": conns["unique_ips"],
@@ -396,7 +495,7 @@ async def stats():
 @app.get("/status")
 async def status():
     """Full node status — no session required."""
-    proc_io = _get_process_io()
+    traffic = _get_traffic()
     conns = _get_active_connections()
     return {
         "service": "lightline-node",
@@ -407,8 +506,8 @@ async def status():
         "ss_port": get_server_port(),
         "connected": _connected,
         "client_ip": _client_ip,
-        "traffic_upload": _traffic_offset["upload"] + proc_io["upload"],
-        "traffic_download": _traffic_offset["download"] + proc_io["download"],
+        "traffic_upload": traffic["upload"],
+        "traffic_download": traffic["download"],
         "active_connections": conns["count"],
         "connected_devices": conns["devices"],
     }
