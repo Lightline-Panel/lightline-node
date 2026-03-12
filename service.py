@@ -265,13 +265,18 @@ def start_ss_server():
     ss_port = get_server_port()
     logger.info(f"SS config: port={ss_port}, method={SS_METHOD}, users={user_count}")
 
+    if user_count == 0:
+        logger.warning("No users in config — outline-ss-server won't bind any port. Skipping start.")
+        return True
+
     binary = 'outline-ss-server'
     try:
-        cmd = [binary, '-config', config_path, '-replay_history', '10000', '-verbose']
+        cmd = [binary, '-config', config_path, '-replay_history', '10000']
         logger.info(f"Starting: {' '.join(cmd)}")
         _ss_process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            stdout=open('/tmp/outline-ss.log', 'a'),
+            stderr=subprocess.STDOUT
         )
         # Wait briefly to check if it crashed immediately
         import time as _t
@@ -280,7 +285,8 @@ def start_ss_server():
             rc = _ss_process.returncode
             out = ''
             try:
-                out = _ss_process.stdout.read().decode(errors='replace')[:2000]
+                with open('/tmp/outline-ss.log') as f:
+                    out = f.read()[-2000:]
             except Exception:
                 pass
             logger.error(f"{binary} exited immediately with code {rc}: {out}")
@@ -332,10 +338,13 @@ def reload_ss_server():
 def restart_ss_server():
     """Restart ss-server to pick up config changes.
     
-    Prefers SIGHUP hot-reload. Falls back to stop+start.
+    If running, send SIGHUP for hot-reload.
+    If not running (dead or never started), do a full start.
     """
     if _ss_process and _ss_process.poll() is None:
         return reload_ss_server()
+    # Process not running — kill stale ref and start fresh
+    stop_ss_server()
     return start_ss_server()
 
 
