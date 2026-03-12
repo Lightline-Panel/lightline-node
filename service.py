@@ -41,16 +41,34 @@ def start_ss_server():
         logger.info("ss-server already running")
         return True
 
+    # Ensure config exists before starting
     config_path = get_config_path()
+    config = load_config()
+    save_config(config)  # write default config if missing
+    logger.info(f"SS config: port={config.get('server_port')}, method={config.get('method')}, password={'***' if config.get('password') else 'EMPTY'}")
+
     for binary in ['ssserver', 'ss-server']:
         try:
+            # Don't pipe stdout/stderr — let it write to container logs and avoids pipe buffer deadlock
             _ss_process = subprocess.Popen(
-                [binary, '-c', config_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                [binary, '-c', config_path, '-U'],
+                stdout=None, stderr=None
             )
+            # Wait briefly to check if it crashed immediately
+            import time as _t
+            _t.sleep(0.5)
+            if _ss_process.poll() is not None:
+                rc = _ss_process.returncode
+                logger.error(f"{binary} exited immediately with code {rc}")
+                _ss_process = None
+                continue
             logger.info(f"Started {binary} (PID {_ss_process.pid}) with config {config_path}")
             return True
         except FileNotFoundError:
+            logger.debug(f"{binary} not found, trying next...")
+            continue
+        except Exception as e:
+            logger.error(f"Failed to start {binary}: {e}")
             continue
     logger.error("No shadowsocks binary found! Install shadowsocks-rust or shadowsocks-libev.")
     return False
