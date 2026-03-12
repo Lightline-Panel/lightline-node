@@ -47,11 +47,24 @@ def start_ss_server():
     save_config(config)  # write default config if missing
     logger.info(f"SS config: port={config.get('server_port')}, method={config.get('method')}, password={'***' if config.get('password') else 'EMPTY'}")
 
+    ss_port = config.get('server_port', 8388)
+    ss_method = config.get('method', 'chacha20-ietf-poly1305')
+    ss_password = config.get('password', '')
+
     for binary in ['ssserver', 'ss-server']:
         try:
-            # Don't pipe stdout/stderr — let it write to container logs and avoids pipe buffer deadlock
+            # ssserver v1.20+ requires --encrypt-method and --server-addr even with -c
+            cmd = [
+                binary,
+                '-s', f'0.0.0.0:{ss_port}',
+                '-m', ss_method,
+                '-k', ss_password,
+                '-U',  # UDP relay
+                '--no-delay',
+            ]
+            logger.info(f"Starting: {binary} -s 0.0.0.0:{ss_port} -m {ss_method} -k *** -U --no-delay")
             _ss_process = subprocess.Popen(
-                [binary, '-c', config_path, '-U'],
+                cmd,
                 stdout=None, stderr=None
             )
             # Wait briefly to check if it crashed immediately
