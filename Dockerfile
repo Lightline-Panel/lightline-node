@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certifi
     else SS_ARCH="linux_x86_64"; fi && \
     SS_VER="1.9.2" && \
     wget -q "https://github.com/OutlineFoundation/tunnel-server/releases/download/v${SS_VER}/outline-ss-server_${SS_VER}_${SS_ARCH}.tar.gz" -O /tmp/ss.tar.gz && \
-    tar -xzf /tmp/ss.tar.gz -C /usr/local/bin/ outline-ss-server && \
+    tar -xzf /tmp/ss.tar.gz -C /usr/local/bin/ && \
+    chmod +x /usr/local/bin/outline-ss-server && \
     rm /tmp/ss.tar.gz && \
     apt-get purge -y wget && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 

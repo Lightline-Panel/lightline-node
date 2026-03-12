@@ -267,18 +267,23 @@ def start_ss_server():
 
     binary = 'outline-ss-server'
     try:
-        cmd = [binary, '-config', config_path, '-replay_history', '10000']
+        cmd = [binary, '-config', config_path, '-replay_history', '10000', '-verbose']
         logger.info(f"Starting: {' '.join(cmd)}")
         _ss_process = subprocess.Popen(
             cmd,
-            stdout=None, stderr=None
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         )
         # Wait briefly to check if it crashed immediately
         import time as _t
-        _t.sleep(0.5)
+        _t.sleep(1.0)
         if _ss_process.poll() is not None:
             rc = _ss_process.returncode
-            logger.error(f"{binary} exited immediately with code {rc}")
+            out = ''
+            try:
+                out = _ss_process.stdout.read().decode(errors='replace')[:2000]
+            except Exception:
+                pass
+            logger.error(f"{binary} exited immediately with code {rc}: {out}")
             _ss_process = None
             return False
         logger.info(f"Started {binary} (PID {_ss_process.pid}) with {user_count} users on port {ss_port}")
@@ -305,9 +310,32 @@ def stop_ss_server():
     _ss_process = None
 
 
+def reload_ss_server():
+    """Send SIGHUP to outline-ss-server to hot-reload config.
+    
+    outline-ss-server natively supports SIGHUP for config reload
+    without dropping existing connections.
+    """
+    global _ss_process
+    if _ss_process and _ss_process.poll() is None:
+        try:
+            _ss_process.send_signal(signal.SIGHUP)
+            logger.info(f"Sent SIGHUP to outline-ss-server (PID {_ss_process.pid}) for config reload")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send SIGHUP: {e}")
+            return False
+    # Not running, start it
+    return start_ss_server()
+
+
 def restart_ss_server():
-    """Restart ss-server to pick up config changes."""
-    stop_ss_server()
+    """Restart ss-server to pick up config changes.
+    
+    Prefers SIGHUP hot-reload. Falls back to stop+start.
+    """
+    if _ss_process and _ss_process.poll() is None:
+        return reload_ss_server()
     return start_ss_server()
 
 
