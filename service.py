@@ -104,6 +104,9 @@ _PROM_DATA_RE = re.compile(
 _PROM_DATA_RE_TOTAL = re.compile(
     r'shadowsocks_data_bytes_per_location\{.*?access_key="([^"]*)",.*?dir="(c2s|s2c|s2p|p2t)".*?\}\s+(\d+)'
 )
+_PROM_TCP_CONNS_RE = re.compile(
+    r'shadowsocks_tcp_open_connections\{access_key="([^"]*)"\}\s+(\d+)'
+)
 
 def _scrape_prometheus() -> str:
     """Fetch raw Prometheus metrics text from outline-ss-server."""
@@ -146,6 +149,21 @@ def _parse_per_user_traffic(metrics_text: str) -> dict:
         elif direction in ('s2c', 's2p'):
             per_user[key_id]["download"] += int(byte_str)
     return per_user
+
+
+def _parse_per_user_connections(metrics_text: str) -> dict:
+    """Parse per-user active TCP connections from Prometheus metrics.
+    
+    outline-ss-server exports:
+      shadowsocks_tcp_open_connections{access_key="username"} N
+    
+    Returns: {"username": int_connection_count, ...}
+    """
+    conns = {}
+    for match in _PROM_TCP_CONNS_RE.finditer(metrics_text):
+        key_id, count_str = match.groups()
+        conns[key_id] = conns.get(key_id, 0) + int(count_str)
+    return conns
 
 
 def _load_traffic_state() -> dict:
@@ -561,10 +579,14 @@ async def stats():
     """
     traffic = _get_traffic()
     conns = _get_active_connections()
+    # Per-user connection counts from Prometheus
+    metrics_text = _scrape_prometheus()
+    per_user_conns = _parse_per_user_connections(metrics_text)
     return {
         "upload": traffic["total"]["upload"],
         "download": traffic["total"]["download"],
         "per_user": traffic.get("per_user", {}),
+        "per_user_connections": per_user_conns,
         "active_connections": conns["count"],
         "connected_devices": conns["devices"],
         "connected_ips": conns["unique_ips"],
