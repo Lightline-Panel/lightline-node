@@ -577,11 +577,22 @@ async def stats():
     Prefers Prometheus metrics from outline-ss-server for per-user data,
     falls back to iptables for total-only.
     """
-    traffic = _get_traffic()
-    conns = _get_active_connections()
-    # Per-user connection counts from Prometheus
+    # Single Prometheus scrape for both traffic and connection data
     metrics_text = _scrape_prometheus()
+    per_user_traffic = _parse_per_user_traffic(metrics_text)
     per_user_conns = _parse_per_user_connections(metrics_text)
+    
+    if per_user_traffic:
+        total_up = sum(u["upload"] for u in per_user_traffic.values())
+        total_down = sum(u["download"] for u in per_user_traffic.values())
+        traffic = {
+            "per_user": per_user_traffic,
+            "total": {"upload": total_up, "download": total_down},
+        }
+    else:
+        traffic = _get_traffic()
+    
+    conns = _get_active_connections()
     return {
         "upload": traffic["total"]["upload"],
         "download": traffic["total"]["download"],
