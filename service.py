@@ -97,15 +97,32 @@ def _read_iptables_bytes() -> dict:
 
 
 # ===== Prometheus Metrics Parsing (per-user traffic from outline-ss-server) =====
+#
+# outline-ss-server v1.9.2 exports metrics like:
+#   shadowsocks_data_bytes{access_key="Mekan",dir="c<p"} 12345
+#   shadowsocks_data_bytes{access_key="Mekan",dir="p>t"} 12300
+#   shadowsocks_data_bytes_per_location{access_key="Mekan",dir="c<p",location="XX"} 12345
+#
+# Direction labels: c<p (client->proxy), p>t (proxy->target) = upload
+#                   p>c (proxy->client), t>p (target->proxy) = download
+#
+# We match any shadowsocks_data_bytes line with an access_key label,
+# regardless of other labels or direction values.
 
+# Captures: access_key, dir, bytes — from shadowsocks_data_bytes (NOT per_location)
 _PROM_DATA_RE = re.compile(
-    r'shadowsocks_data_bytes\{access_key="([^"]*)",dir="(c2s|s2c|s2p|p2t)"\}\s+(\d+)'
+    r'shadowsocks_data_bytes\{[^}]*access_key="([^"]*)"[^}]*dir="([^"]*)"[^}]*\}\s+(\d+(?:\.\d+)?(?:e\+?\d+)?)'
 )
-_PROM_DATA_RE_TOTAL = re.compile(
-    r'shadowsocks_data_bytes_per_location\{.*?access_key="([^"]*)",.*?dir="(c2s|s2c|s2p|p2t)".*?\}\s+(\d+)'
+# Also handle reversed label order (dir before access_key)
+_PROM_DATA_RE_ALT = re.compile(
+    r'shadowsocks_data_bytes\{[^}]*dir="([^"]*)"[^}]*access_key="([^"]*)"[^}]*\}\s+(\d+(?:\.\d+)?(?:e\+?\d+)?)'
 )
-_PROM_TCP_CONNS_RE = re.compile(
-    r'shadowsocks_tcp_open_connections\{access_key="([^"]*)"\}\s+(\d+)'
+# TCP connection counters (per access_key)
+_PROM_TCP_OPENED_RE = re.compile(
+    r'shadowsocks_tcp_connections_opened\{[^}]*access_key="([^"]*)"[^}]*\}\s+(\d+(?:\.\d+)?(?:e\+?\d+)?)'
+)
+_PROM_TCP_CLOSED_RE = re.compile(
+    r'shadowsocks_tcp_connections_closed\{[^}]*access_key="([^"]*)"[^}]*\}\s+(\d+(?:\.\d+)?(?:e\+?\d+)?)'
 )
 
 def _scrape_prometheus() -> str:
@@ -121,48 +138,72 @@ def _scrape_prometheus() -> str:
 def _parse_per_user_traffic(metrics_text: str) -> dict:
     """Parse per-user traffic from Prometheus metrics.
     
-    outline-ss-server exports:
-      shadowsocks_data_bytes{access_key="username",dir="c2s"} NNN
-      shadowsocks_data_bytes{access_key="username",dir="s2c"} NNN
+    outline-ss-server exports 4 direction labels per access_key:
+      c<p (proxy→client, download), p>t (proxy→target, upload)
+      c>p (client→proxy, upload),   p<t (target→proxy, download)
     
-    c2s = client-to-server = upload from client perspective
-    s2c = server-to-client = download from client perspective
+    Outline Server itself uses sum of c<p + p>t for total traffic.
+    We do the same to avoid double-counting.
     
     Returns: {"username": {"upload": int, "download": int}, ...}
     """
+    # Directions that Outline Server counts as total traffic
+    VALID_DIRS = {'c<p', 'p>t'}
     per_user = {}
+    
+    # Try primary regex (access_key before dir)
     for match in _PROM_DATA_RE.finditer(metrics_text):
         key_id, direction, byte_str = match.groups()
+        if not key_id or direction not in VALID_DIRS:
+            continue
         if key_id not in per_user:
             per_user[key_id] = {"upload": 0, "download": 0}
-        if direction in ('c2s', 'p2t'):
-            per_user[key_id]["upload"] += int(byte_str)
-        elif direction in ('s2c', 's2p'):
-            per_user[key_id]["download"] += int(byte_str)
-    # Also try per_location variant
-    for match in _PROM_DATA_RE_TOTAL.finditer(metrics_text):
-        key_id, direction, byte_str = match.groups()
-        if key_id not in per_user:
-            per_user[key_id] = {"upload": 0, "download": 0}
-        if direction in ('c2s', 'p2t'):
-            per_user[key_id]["upload"] += int(byte_str)
-        elif direction in ('s2c', 's2p'):
-            per_user[key_id]["download"] += int(byte_str)
+        if direction == 'p>t':
+            per_user[key_id]["upload"] += int(float(byte_str))
+        elif direction == 'c<p':
+            per_user[key_id]["download"] += int(float(byte_str))
+    
+    # Try alternate regex (dir before access_key) if primary found nothing
+    if not per_user:
+        for match in _PROM_DATA_RE_ALT.finditer(metrics_text):
+            direction, key_id, byte_str = match.groups()
+            if not key_id or direction not in VALID_DIRS:
+                continue
+            if key_id not in per_user:
+                per_user[key_id] = {"upload": 0, "download": 0}
+            if direction == 'p>t':
+                per_user[key_id]["upload"] += int(float(byte_str))
+            elif direction == 'c<p':
+                per_user[key_id]["download"] += int(float(byte_str))
+    
     return per_user
 
 
 def _parse_per_user_connections(metrics_text: str) -> dict:
     """Parse per-user active TCP connections from Prometheus metrics.
     
-    outline-ss-server exports:
-      shadowsocks_tcp_open_connections{access_key="username"} N
+    outline-ss-server exports opened/closed counters per access_key:
+      shadowsocks_tcp_connections_opened{access_key="username"} N
+      shadowsocks_tcp_connections_closed{access_key="username"} N
+    
+    Active connections = opened - closed.
     
     Returns: {"username": int_connection_count, ...}
     """
-    conns = {}
-    for match in _PROM_TCP_CONNS_RE.finditer(metrics_text):
+    opened = {}
+    closed = {}
+    for match in _PROM_TCP_OPENED_RE.finditer(metrics_text):
         key_id, count_str = match.groups()
-        conns[key_id] = conns.get(key_id, 0) + int(count_str)
+        if key_id:
+            opened[key_id] = opened.get(key_id, 0) + int(float(count_str))
+    for match in _PROM_TCP_CLOSED_RE.finditer(metrics_text):
+        key_id, count_str = match.groups()
+        if key_id:
+            closed[key_id] = closed.get(key_id, 0) + int(float(count_str))
+    conns = {}
+    for key_id in set(list(opened.keys()) + list(closed.keys())):
+        active = opened.get(key_id, 0) - closed.get(key_id, 0)
+        conns[key_id] = max(0, active)
     return conns
 
 
@@ -602,6 +643,23 @@ async def stats():
         "connected_devices": conns["devices"],
         "connected_ips": conns["unique_ips"],
         "ss_running": is_ss_running(),
+    }
+
+
+@app.get("/debug/metrics")
+async def debug_metrics():
+    """Debug endpoint: raw Prometheus metrics and parsed results — no auth required."""
+    metrics_text = _scrape_prometheus()
+    per_user_traffic = _parse_per_user_traffic(metrics_text)
+    per_user_conns = _parse_per_user_connections(metrics_text)
+    # Show first 50 lines that contain 'shadowsocks' for quick inspection
+    ss_lines = [l for l in metrics_text.split('\n') if 'shadowsocks' in l.lower()][:50]
+    return {
+        "metrics_length": len(metrics_text),
+        "prometheus_reachable": len(metrics_text) > 0,
+        "shadowsocks_metric_lines": ss_lines,
+        "parsed_per_user_traffic": per_user_traffic,
+        "parsed_per_user_connections": per_user_conns,
     }
 
 
